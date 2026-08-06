@@ -17,7 +17,158 @@ private enum Style {
 }
 
 private let watchedExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "pdf"]
+private let recordingExtensions: Set<String> = ["mov", "mp4"]
 private let shotFileManager = Foundation.FileManager()
+
+// MARK: - Temporary capture workspace
+
+/// Redirects macOS' normal screenshot machinery into a private, per-run folder.
+/// The original destination is restored when ShotPin exits, and stale state from
+/// an interrupted prior run is repaired the next time ShotPin launches.
+final class CaptureWorkspace {
+    static let shared = CaptureWorkspace()
+
+    private enum Key {
+        static let active = "captureWorkspace.active"
+        static let path = "captureWorkspace.path"
+        static let previousLocation = "captureWorkspace.previousLocation"
+        static let previousLocationExisted = "captureWorkspace.previousLocationExisted"
+    }
+
+    private let appDefaults = UserDefaults.standard
+    private let captureDomain = "com.apple.screencapture" as CFString
+    private(set) var directory: URL?
+
+    private init() {}
+
+    func begin() throws {
+        recoverInterruptedSession()
+
+        let captureDefaults = UserDefaults(suiteName: captureDomain as String)
+        let previousLocation = captureDefaults?.string(forKey: "location")
+        let root = shotFileManager.temporaryDirectory
+            .appendingPathComponent("ShotPin", isDirectory: true)
+        try shotFileManager.createDirectory(at: root,
+                                            withIntermediateDirectories: true,
+                                            attributes: [.posixPermissions: 0o700])
+        let workspace = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try shotFileManager.createDirectory(at: workspace,
+                                            withIntermediateDirectories: false,
+                                            attributes: [.posixPermissions: 0o700])
+
+        // Persist recovery information before changing the global capture setting.
+        appDefaults.set(true, forKey: Key.active)
+        appDefaults.set(workspace.path, forKey: Key.path)
+        appDefaults.set(previousLocation != nil, forKey: Key.previousLocationExisted)
+        if let previousLocation {
+            appDefaults.set(previousLocation, forKey: Key.previousLocation)
+        } else {
+            appDefaults.removeObject(forKey: Key.previousLocation)
+        }
+
+        setCaptureLocation(workspace.path)
+        directory = workspace
+    }
+
+    func end() {
+        guard appDefaults.bool(forKey: Key.active) else { return }
+        restorePreviousLocation()
+        if let path = appDefaults.string(forKey: Key.path) {
+            discardWorkspace(at: URL(fileURLWithPath: path))
+        }
+        clearRecoveryState()
+        directory = nil
+    }
+
+    private func recoverInterruptedSession() {
+        guard appDefaults.bool(forKey: Key.active) else { return }
+        restorePreviousLocation()
+        if let path = appDefaults.string(forKey: Key.path) {
+            discardWorkspace(at: URL(fileURLWithPath: path))
+        }
+        clearRecoveryState()
+    }
+
+    private func restorePreviousLocation() {
+        if appDefaults.bool(forKey: Key.previousLocationExisted),
+           let location = appDefaults.string(forKey: Key.previousLocation) {
+            setCaptureLocation(location)
+        } else {
+            CFPreferencesSetAppValue("location" as CFString, nil, captureDomain)
+            CFPreferencesAppSynchronize(captureDomain)
+        }
+    }
+
+    private func setCaptureLocation(_ path: String) {
+        CFPreferencesSetAppValue("location" as CFString, path as CFString, captureDomain)
+        CFPreferencesAppSynchronize(captureDomain)
+    }
+
+    /// The screenshot preference also controls screen recordings made through
+    /// Command-Shift-5. Preserve those in the user's original destination while
+    /// deleting screenshots and other private workspace contents.
+    private func discardWorkspace(at workspace: URL) {
+        guard let contents = try? shotFileManager.contentsOfDirectory(
+            at: workspace,
+            includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants]
+        ) else { return }
+
+        let destination = previousCaptureDirectory()
+        for url in contents {
+            if recordingExtensions.contains(url.pathExtension.lowercased()) {
+                let target = uniqueDestination(for: url.lastPathComponent, in: destination)
+                do {
+                    try shotFileManager.createDirectory(at: destination,
+                                                        withIntermediateDirectories: true)
+                    try shotFileManager.moveItem(at: url, to: target)
+                } catch {
+                    NSLog("ShotPin: could not preserve recording at %@: %@",
+                          url.path, error.localizedDescription)
+                }
+            } else {
+                try? shotFileManager.removeItem(at: url)
+            }
+        }
+
+        if let remaining = try? shotFileManager.contentsOfDirectory(atPath: workspace.path),
+           remaining.isEmpty {
+            try? shotFileManager.removeItem(at: workspace)
+        }
+    }
+
+    private func previousCaptureDirectory() -> URL {
+        if appDefaults.bool(forKey: Key.previousLocationExisted),
+           let path = appDefaults.string(forKey: Key.previousLocation),
+           !path.isEmpty {
+            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath,
+                       isDirectory: true)
+        }
+        return shotFileManager.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop")
+    }
+
+    private func uniqueDestination(for name: String, in directory: URL) -> URL {
+        let original = directory.appendingPathComponent(name)
+        guard shotFileManager.fileExists(atPath: original.path) else { return original }
+        let source = URL(fileURLWithPath: name)
+        let stem = source.deletingPathExtension().lastPathComponent
+        let ext = source.pathExtension
+        for index in 2...10_000 {
+            let candidateName = ext.isEmpty ? "\(stem) \(index)" : "\(stem) \(index).\(ext)"
+            let candidate = directory.appendingPathComponent(candidateName)
+            if !shotFileManager.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return directory.appendingPathComponent("\(UUID().uuidString)-\(name)")
+    }
+
+    private func clearRecoveryState() {
+        appDefaults.removeObject(forKey: Key.active)
+        appDefaults.removeObject(forKey: Key.path)
+        appDefaults.removeObject(forKey: Key.previousLocation)
+        appDefaults.removeObject(forKey: Key.previousLocationExisted)
+    }
+}
 
 // MARK: - Where screenshots land
 
@@ -180,14 +331,13 @@ final class ShotView: NSView, NSDraggingSource {
 
     func draggingSession(_ session: NSDraggingSession,
                          sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        return [.copy, .generic]
+        return .copy
     }
 
     func draggingSession(_ session: NSDraggingSession,
                          endedAt screenPoint: NSPoint,
                          operation: NSDragOperation) {
         draggingOut = false
-        if !operation.isEmpty { dismissPin() }
     }
 
     // MARK: context menu
@@ -198,7 +348,7 @@ final class ShotView: NSView, NSDraggingSource {
         menu.addItem(withTitle: "Copy Image", action: #selector(copyImage), keyEquivalent: "")
         menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealInFinder), keyEquivalent: "")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Move to Trash", action: #selector(trashFile), keyEquivalent: "")
+        menu.addItem(withTitle: "Delete Screenshot", action: #selector(trashFile), keyEquivalent: "")
         menu.addItem(withTitle: "Dismiss", action: #selector(dismissPin), keyEquivalent: "")
         menu.addItem(withTitle: "Dismiss All", action: #selector(dismissAll), keyEquivalent: "")
         menu.addItem(.separator())
@@ -212,9 +362,7 @@ final class ShotView: NSView, NSDraggingSource {
             showError("The file no longer exists")
             return
         }
-        if NSWorkspace.shared.open(url) {
-            dismissPin()
-        } else {
+        if !NSWorkspace.shared.open(url) {
             showError("Couldn't open the screenshot")
         }
     }
@@ -245,9 +393,7 @@ final class ShotView: NSView, NSDraggingSource {
                 }
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
-                if pasteboard.writeObjects([item]) {
-                    self.dismissPin()
-                } else {
+                if !pasteboard.writeObjects([item]) {
                     self.showError("Couldn't copy the screenshot")
                 }
             }
@@ -260,15 +406,14 @@ final class ShotView: NSView, NSDraggingSource {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
-        dismissPin()
     }
 
     @objc private func trashFile() {
         do {
-            try shotFileManager.trashItem(at: url, resultingItemURL: nil)
+            try shotFileManager.removeItem(at: url)
             dismissPin()
         } catch {
-            showError("Couldn't move the file to Trash")
+            showError("Couldn't delete the screenshot")
         }
     }
 
@@ -559,6 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: DirectoryWatcher?
     private var watchedDirectory: URL?
     private var watcherRefreshTimer: Timer?
+    private var terminationSignalSources: [DispatchSourceSignal] = []
     private var pending: [FileIdentity: UUID] = [:]
     private var recentlyHandled: [FileIdentity: Date] = [:]
 
@@ -575,6 +721,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        do {
+            try CaptureWorkspace.shared.begin()
+        } catch {
+            NSLog("ShotPin: could not create temporary capture workspace: %@", error.localizedDescription)
+            NSApp.terminate(nil)
+            return
+        }
+        installTerminationSignalHandlers()
         configureWatcher(force: true)
         watcherRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.configureWatcher(force: false)
@@ -588,8 +742,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        watcherRefreshTimer?.invalidate()
+        watcher = nil
+        CaptureWorkspace.shared.end()
+    }
+
+    /// launchctl normally stops agents with SIGTERM. Convert that signal into a
+    /// normal AppKit termination so the capture location is always restored.
+    private func installTerminationSignalHandlers() {
+        for number in [SIGTERM, SIGINT] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { NSApp.terminate(nil) }
+            source.resume()
+            terminationSignalSources.append(source)
+        }
+    }
+
     private func configureWatcher(force: Bool) {
-        let directory = screenshotDirectory().standardizedFileURL
+        let directory = (CaptureWorkspace.shared.directory ?? screenshotDirectory()).standardizedFileURL
         guard force || directory != watchedDirectory || watcher == nil else { return }
         watcher = nil
         watchedDirectory = directory
@@ -657,8 +829,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
         let stable = size > 0 && size == lastSize
         let capture = isScreenCapture(url)
+        let isPrivateCapture = CaptureWorkspace.shared.directory?.standardizedFileURL
+            == url.deletingLastPathComponent().standardizedFileURL
 
-        if capture == false {
+        if !isPrivateCapture && capture == false {
             pending.removeValue(forKey: identity)
             recentlyHandled[identity] = Date()
             return
@@ -668,7 +842,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Arbitrarily named screencapture CLI output normally carries Spotlight's
         // capture attribute and follows the authoritative branch above.
         let generatedNameFallback = capture == nil && hasGeneratedScreenshotName(url)
-        if (stable && capture == true) || (exhausted && stable && generatedNameFallback) {
+        if (stable && isPrivateCapture)
+            || (stable && capture == true)
+            || (exhausted && stable && generatedNameFallback) {
             pending.removeValue(forKey: identity)
             recentlyHandled[identity] = Date()
             show(url: url)
