@@ -324,9 +324,12 @@ final class ShotView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
-        defer { mouseDownPoint = nil }
-        guard !draggingOut else { return }
-        openFile()
+        let shouldOpen = !draggingOut
+        mouseDownPoint = nil
+        draggingOut = false
+        if shouldOpen {
+            openFile()
+        }
     }
 
     func draggingSession(_ session: NSDraggingSession,
@@ -337,7 +340,9 @@ final class ShotView: NSView, NSDraggingSource {
     func draggingSession(_ session: NSDraggingSession,
                          endedAt screenPoint: NSPoint,
                          operation: NSDragOperation) {
-        draggingOut = false
+        // AppKit may end the dragging session before delivering the source
+        // view's mouseUp. Keep the flag set so that mouseUp cannot interpret
+        // the completed drag as a click and open the screenshot.
     }
 
     // MARK: context menu
