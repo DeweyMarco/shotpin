@@ -25,6 +25,29 @@ OLD_THUMBNAIL_VALUE=""
 LOCK_OWNED=false
 LOCK_CHILD_PID=""
 
+wait_for_agent_removal() {
+  local attempt
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if ! launchctl print "$SERVICE" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+unload_agent() {
+  if ! launchctl print "$SERVICE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # bootout returns after requesting termination, not after launchd has removed
+  # the job. A bootstrap during that interval fails with EINPROGRESS (reported
+  # by launchctl as error 5), so wait for the old job to disappear completely.
+  launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+  wait_for_agent_removal
+}
+
 release_install_lock() {
   if [[ "$LOCK_OWNED" == true ]]; then
     rm -f "$LOCK_FILE" || true
@@ -58,30 +81,38 @@ rollback() {
 
   set +e
   local rollback_failed=false
-  if launchctl print "$SERVICE" >/dev/null 2>&1 \
-      && ! launchctl bootout "$SERVICE" >/dev/null 2>&1; then
+  local agent_unloaded=true
+  local plist_restored=true
+  local app_restored=true
+  if ! unload_agent; then
     rollback_failed=true
+    agent_unloaded=false
   fi
 
   if [[ "$OLD_PLIST_EXISTS" == true ]]; then
     if ! install -m 644 "$INSTALL_DIR/Previous.plist" "$PLIST"; then
       rollback_failed=true
+      plist_restored=false
     fi
   else
     if ! rm -f "$PLIST"; then
       rollback_failed=true
+      plist_restored=false
     fi
   fi
 
   if [[ "$OLD_APP_EXISTS" == true ]]; then
     if ! rm -rf "$APP"; then
       rollback_failed=true
+      app_restored=false
     elif ! mv "$INSTALL_DIR/Previous.app" "$APP"; then
       rollback_failed=true
+      app_restored=false
     fi
   else
     if ! rm -rf "$APP"; then
       rollback_failed=true
+      app_restored=false
     fi
   fi
 
@@ -97,21 +128,28 @@ rollback() {
     fi
   fi
 
-  if [[ "$OLD_AGENT_LOADED" == true && "$OLD_PLIST_EXISTS" == true ]]; then
+  if [[ "$OLD_AGENT_LOADED" == true && "$OLD_PLIST_EXISTS" == true \
+      && "$agent_unloaded" == true && "$plist_restored" == true \
+      && "$app_restored" == true ]]; then
     local restore_plist="$PLIST"
+    local restore_plist_ready=true
     if [[ "$OLD_AGENT_RUNNING" == false ]]; then
       restore_plist="$INSTALL_DIR/Previous.stopped.plist"
       if ! cp "$INSTALL_DIR/Previous.plist" "$restore_plist"; then
         rollback_failed=true
+        restore_plist_ready=false
       elif ! plutil -replace RunAtLoad -bool false "$restore_plist" 2>/dev/null \
           && ! plutil -insert RunAtLoad -bool false "$restore_plist"; then
         rollback_failed=true
+        restore_plist_ready=false
       fi
     fi
-    if [[ "$rollback_failed" == false ]] \
+    if [[ "$restore_plist_ready" == true ]] \
         && ! launchctl bootstrap "$DOMAIN" "$restore_plist" >/dev/null 2>&1; then
       rollback_failed=true
     fi
+  elif [[ "$OLD_AGENT_LOADED" == true ]]; then
+    rollback_failed=true
   fi
 
   if [[ "$rollback_failed" == true ]]; then
@@ -178,6 +216,14 @@ if [[ -n "$AGENT_STATE" ]]; then
 fi
 if OLD_THUMBNAIL_VALUE="$(defaults read com.apple.screencapture show-thumbnail 2>/dev/null)"; then
   OLD_THUMBNAIL_EXISTS=true
+  case "$OLD_THUMBNAIL_VALUE" in
+    1|true|TRUE|yes|YES) OLD_THUMBNAIL_VALUE=true ;;
+    0|false|FALSE|no|NO) OLD_THUMBNAIL_VALUE=false ;;
+    *)
+      echo "Expected com.apple.screencapture show-thumbnail to be a boolean." >&2
+      exit 1
+      ;;
+  esac
 fi
 
 ROLLBACK_READY=true
@@ -198,7 +244,10 @@ plutil -lint "$NEW_PLIST"
 THUMBNAIL_CHANGED=true
 defaults write com.apple.screencapture show-thumbnail -bool false
 
-launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+if ! unload_agent; then
+  echo "Timed out waiting for the existing ShotPin agent to stop." >&2
+  exit 1
+fi
 install -m 644 "$NEW_PLIST" "$PLIST"
 launchctl bootstrap "$DOMAIN" "$PLIST"
 launchctl kickstart -k "$SERVICE"
