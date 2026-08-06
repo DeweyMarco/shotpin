@@ -6,7 +6,7 @@ it, and keeps the pending screenshot out of your normal save location.
 
 Your capture keys don't change. ⌘⇧3, ⌘⇧4 and ⌘⇧5 keep the native macOS capture and
 selection UI. While ShotPin is running, macOS writes captures into ShotPin's private
-temporary workspace instead of the Desktop, and ShotPin restores your previous screenshot
+per-run workspace instead of the Desktop, and ShotPin restores your previous screenshot
 location when it quits.
 
 ```
@@ -34,9 +34,10 @@ That works (verified on macOS 26.6), and if a longer-but-still-temporary thumbna
 you want, use it instead of this — no third-party code in your login items.
 
 ShotPin preserves that temporary behavior for as long as you want. The screenshot is
-backed by a file in a private temporary workspace so drag and drop works reliably across
+backed by a file in a private per-run workspace so drag and drop works reliably across
 apps, but it never appears in the Desktop or your configured screenshot folder. Clicking
-the pin's ✕ deletes it immediately, and quitting ShotPin deletes every pending capture.
+the pin's ✕ deletes it immediately. Quitting ShotPin deletes closed pending captures;
+if a file is still settling, the next launch retires it safely.
 
 Compared to the full CleanShot X alternatives ([Capso](https://github.com/lzhgus/Capso),
 [BetterShot](https://github.com/KartikLabhshetwar/better-shot),
@@ -60,14 +61,17 @@ corner, oldest at the bottom, and pile up in place once the column runs out of r
 float above other windows and follow you across Spaces and full-screen apps, but don't
 appear in screenshots.
 
-## Temporary capture storage
+## Private capture storage
 
 At launch, ShotPin remembers `com.apple.screencapture location`, redirects screenshots to
 a private per-run directory, and watches that directory for new captures. A normal quit
-restores the previous location and deletes the directory. If ShotPin was interrupted, its
-next launch restores the saved setting and removes the stale workspace before starting a
-new session. Screen recordings aren't pinned; when ShotPin exits, it moves them to the
-original screenshot location instead of deleting them with the pending screenshots.
+restores the previous location and deletes pending captures; the next launch retires the
+workspace after a short grace period for any in-flight capture writer. If ShotPin was
+interrupted, its next launch restores the saved setting, starts a new isolated session,
+and queues the stale workspace for safe cleanup. Screen recordings aren't pinned. ShotPin
+preserves them in the original screenshot location, while a recording that is still
+changing or needs a cross-volume copy stays recoverable until a later launch can move it
+safely.
 
 ## Install
 
@@ -94,11 +98,12 @@ signed, not notarized, because it never leaves your machine.
 ```bash
 launchctl kickstart -k gui/$UID/com.shotpin.agent   # restart, also clears all pins
 launchctl bootout gui/$UID/com.shotpin.agent        # stop until next login
-rm ~/Library/LaunchAgents/com.shotpin.agent.plist   # stop for good
+rm ~/Library/LaunchAgents/com.shotpin.agent.plist   # after bootout, prevent future logins
 defaults write com.apple.screencapture show-thumbnail -bool true   # restore native thumbnail
 ```
 
-Logs are at `/tmp/shotpin.out.log` and `/tmp/shotpin.err.log`. After editing
+Logs are at `~/Library/Logs/ShotPin/shotpin.out.log` and
+`~/Library/Logs/ShotPin/shotpin.err.log`. After editing
 `Sources/main.swift`, run `./build.sh` and then the `kickstart` line.
 
 ## Tuning
