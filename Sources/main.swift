@@ -1,5 +1,8 @@
 import AppKit
 import CoreServices
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 // ShotPin: keeps the newest screenshot pinned in the bottom-right corner of the
 // screen until you actually do something with it. Replaces the native macOS
@@ -14,6 +17,7 @@ private enum Style {
 }
 
 private let watchedExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "pdf"]
+private let shotFileManager = Foundation.FileManager()
 
 // MARK: - Where screenshots land
 
@@ -22,7 +26,7 @@ func screenshotDirectory() -> URL {
        !location.isEmpty {
         return URL(fileURLWithPath: (location as NSString).expandingTildeInPath)
     }
-    return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+    return shotFileManager.urls(for: .desktopDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop")
 }
 
@@ -34,13 +38,33 @@ func isScreenCapture(_ url: URL) -> Bool? {
     return (raw as? NSNumber)?.boolValue ?? false
 }
 
+/// Spotlight is authoritative when it has an answer. This fallback is deliberately
+/// narrow: it only recognizes macOS' generated screenshot names, never arbitrary
+/// fresh images dropped into the watched directory.
+func hasGeneratedScreenshotName(_ url: URL, defaults: UserDefaults? = UserDefaults(suiteName: "com.apple.screencapture")) -> Bool {
+    let configuredName = defaults?.string(forKey: "name")?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefixes = [configuredName, "Screen Shot", "Screenshot"].compactMap { value -> String? in
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+    let stem = url.deletingPathExtension().lastPathComponent
+    return prefixes.contains { prefix in
+        guard stem.hasPrefix(prefix + " ") else { return false }
+        return stem.dropFirst(prefix.count + 1).contains(where: \Character.isNumber)
+    }
+}
+
 // MARK: - The pinned card
 
 final class ShotView: NSView, NSDraggingSource {
+    private static let copyQueue = DispatchQueue(label: "app.shotpin.copy-loader", qos: .userInitiated)
+
     let url: URL
     private let imageView = NSImageView()
     private let card = NSView()
     private let closeButton = NSButton()
+    private let errorLabel = NSTextField(labelWithString: "")
+    private var hideErrorWorkItem: DispatchWorkItem?
     private var mouseDownPoint: NSPoint?
     private var draggingOut = false
     weak var panel: PinPanel?
@@ -75,6 +99,18 @@ final class ShotView: NSView, NSDraggingSource {
         imageView.layer?.cornerRadius = Style.corner
         imageView.layer?.masksToBounds = true
         card.addSubview(imageView)
+
+        errorLabel.alignment = .center
+        errorLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        errorLabel.textColor = .white
+        errorLabel.maximumNumberOfLines = 2
+        errorLabel.lineBreakMode = .byWordWrapping
+        errorLabel.frame = NSRect(x: 6, y: 6, width: card.bounds.width - 12, height: 34)
+        errorLabel.wantsLayer = true
+        errorLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        errorLabel.layer?.cornerRadius = 5
+        errorLabel.isHidden = true
+        card.addSubview(errorLabel)
 
         let glyph = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Dismiss")
         closeButton.image = glyph
@@ -127,8 +163,7 @@ final class ShotView: NSView, NSDraggingSource {
     override func mouseUp(with event: NSEvent) {
         defer { mouseDownPoint = nil }
         guard !draggingOut else { return }
-        NSWorkspace.shared.open(url)
-        dismissPin()
+        openFile()
     }
 
     func draggingSession(_ session: NSDraggingSession,
@@ -161,26 +196,81 @@ final class ShotView: NSView, NSDraggingSource {
     }
 
     @objc private func openFile() {
-        NSWorkspace.shared.open(url)
-        dismissPin()
+        guard shotFileManager.fileExists(atPath: url.path) else {
+            showError("The file no longer exists")
+            return
+        }
+        if NSWorkspace.shared.open(url) {
+            dismissPin()
+        } else {
+            showError("Couldn't open the screenshot")
+        }
     }
 
     @objc private func copyImage() {
-        guard let image = imageView.image else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects([image, url as NSURL])
-        dismissPin()
+        guard shotFileManager.fileExists(atPath: url.path),
+              let contentType = UTType(filenameExtension: url.pathExtension),
+              contentType.conforms(to: .image) || contentType.conforms(to: .pdf) else {
+            showError("Couldn't read the screenshot")
+            return
+        }
+
+        let url = url
+        Self.copyQueue.async { [weak self] in
+            let data = try? Data(contentsOf: url, options: .mappedIfSafe)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let data else {
+                    self.showError("Couldn't read the screenshot")
+                    return
+                }
+
+                let item = NSPasteboardItem()
+                let type = NSPasteboard.PasteboardType(contentType.identifier)
+                guard item.setData(data, forType: type) else {
+                    self.showError("Couldn't copy the screenshot")
+                    return
+                }
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                if pasteboard.writeObjects([item]) {
+                    self.dismissPin()
+                } else {
+                    self.showError("Couldn't copy the screenshot")
+                }
+            }
+        }
     }
 
     @objc private func revealInFinder() {
+        guard shotFileManager.fileExists(atPath: url.path) else {
+            showError("The file no longer exists")
+            return
+        }
         NSWorkspace.shared.activateFileViewerSelecting([url])
         dismissPin()
     }
 
     @objc private func trashFile() {
-        try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        dismissPin()
+        do {
+            try shotFileManager.trashItem(at: url, resultingItemURL: nil)
+            dismissPin()
+        } catch {
+            showError("Couldn't move the file to Trash")
+        }
+    }
+
+    private func showError(_ message: String) {
+        hideErrorWorkItem?.cancel()
+        errorLabel.stringValue = message
+        errorLabel.isHidden = false
+        errorLabel.superview?.addSubview(errorLabel, positioned: .above, relativeTo: nil)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.errorLabel.isHidden = true
+        }
+        hideErrorWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
     }
 
     @objc private func dismissAll() { PinManager.shared.dismissAll() }
@@ -191,10 +281,10 @@ final class ShotView: NSView, NSDraggingSource {
 // MARK: - Floating panel
 
 final class PinPanel: NSPanel {
-    let targetScreen: NSScreen
+    var targetDisplayID: CGDirectDisplayID
 
     init(url: URL, image: NSImage, screen: NSScreen) {
-        self.targetScreen = screen
+        self.targetDisplayID = screen.displayID
 
         var fit = image.size
         if fit.width <= 0 || fit.height <= 0 { fit = NSSize(width: 160, height: 100) }
@@ -269,10 +359,18 @@ final class PinManager {
     /// out of room the newest ones pile on top of each other rather than walking
     /// off the top of the screen.
     func layout() {
-        for screen in NSScreen.screens {
+        let availableScreens = NSScreen.screens
+        guard !availableScreens.isEmpty else { return }
+        let fallbackScreen = NSScreen.main ?? availableScreens[0]
+
+        for panel in panels where !availableScreens.contains(where: { $0.displayID == panel.targetDisplayID }) {
+            panel.targetDisplayID = fallbackScreen.displayID
+        }
+
+        for screen in availableScreens {
             let area = screen.visibleFrame
             var y = area.minY + Style.screenMargin
-            for panel in panels where panel.targetScreen === screen {
+            for panel in panels where panel.targetDisplayID == screen.displayID {
                 let size = panel.frame.size
                 let clampedY = min(y, area.maxY - size.height - Style.screenMargin)
                 let x = area.maxX - size.width - Style.screenMargin
@@ -280,6 +378,77 @@ final class PinManager {
                 y = clampedY + size.height + Style.stackSpacing
             }
         }
+    }
+}
+
+private extension NSScreen {
+    var displayID: CGDirectDisplayID {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+}
+
+// MARK: - Thumbnail decoding
+
+private enum ThumbnailLoader {
+    private static let queue = DispatchQueue(label: "app.shotpin.thumbnail-loader", qos: .userInitiated)
+    private static let maxPixelDimension = Int(Style.maxDimension * 2)
+
+    static func load(_ url: URL, completion: @escaping (NSImage?) -> Void) {
+        queue.async {
+            let image: NSImage? = autoreleasepool {
+                if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+                    let options: [CFString: Any] = [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceShouldCacheImmediately: true,
+                        kCGImageSourceThumbnailMaxPixelSize: maxPixelDimension
+                    ]
+                    if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                        return displayImage(from: cgImage)
+                    }
+                }
+                return pdfThumbnail(url)
+            }
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+
+    private static func pdfThumbnail(_ url: URL) -> NSImage? {
+        guard url.pathExtension.lowercased() == "pdf",
+              let document = CGPDFDocument(url as CFURL),
+              let page = document.page(at: 1) else { return nil }
+        let bounds = page.getBoxRect(.mediaBox)
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        let scale = min(CGFloat(maxPixelDimension) / bounds.width,
+                        CGFloat(maxPixelDimension) / bounds.height,
+                        1)
+        let width = max(1, Int((bounds.width * scale).rounded(.up)))
+        let height = max(1, Int((bounds.height * scale).rounded(.up)))
+        guard let context = CGContext(data: nil,
+                                      width: width,
+                                      height: height,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let target = CGRect(x: 0, y: 0, width: width, height: height)
+        context.concatenate(page.getDrawingTransform(.mediaBox,
+                                                     rect: target,
+                                                     rotate: 0,
+                                                     preserveAspectRatio: true))
+        context.drawPDFPage(page)
+        guard let cgImage = context.makeImage() else { return nil }
+        return displayImage(from: cgImage)
+    }
+
+    private static func displayImage(from cgImage: CGImage) -> NSImage {
+        let pixelSize = NSSize(width: cgImage.width, height: cgImage.height)
+        let scale = min(Style.maxDimension / pixelSize.width,
+                        Style.maxDimension / pixelSize.height,
+                        1)
+        let displaySize = NSSize(width: pixelSize.width * scale,
+                                 height: pixelSize.height * scale)
+        return NSImage(cgImage: cgImage, size: displaySize)
     }
 }
 
@@ -294,14 +463,46 @@ private func watcherCallback(stream: ConstFSEventStreamRef,
     guard let info else { return }
     let watcher = Unmanaged<DirectoryWatcher>.fromOpaque(info).takeUnretainedValue()
     guard let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] else { return }
-    watcher.handler(paths)
+    let events = (0..<min(numEvents, paths.count)).map {
+        DirectoryWatcher.Event(path: paths[$0], flags: flags[$0])
+    }
+    watcher.receive(events)
 }
 
 final class DirectoryWatcher {
-    let handler: ([String]) -> Void
+    struct Event {
+        let path: String
+        let flags: FSEventStreamEventFlags
+
+        var isFile: Bool { flags & UInt32(kFSEventStreamEventFlagItemIsFile) != 0 }
+        var isCreatedOrMoved: Bool {
+            flags & UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRenamed) != 0
+        }
+        var requiresRescan: Bool {
+            flags & UInt32(kFSEventStreamEventFlagMustScanSubDirs
+                | kFSEventStreamEventFlagUserDropped
+                | kFSEventStreamEventFlagKernelDropped
+                | kFSEventStreamEventFlagEventIdsWrapped
+                | kFSEventStreamEventFlagRootChanged) != 0
+        }
+    }
+
+    enum WatchError: LocalizedError {
+        case creationFailed(String)
+        case startFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .creationFailed(let path): return "Could not create an FSEvents stream for \(path)"
+            case .startFailed(let path): return "Could not start the FSEvents stream for \(path)"
+            }
+        }
+    }
+
+    let handler: ([Event]) -> Void
     private var stream: FSEventStreamRef?
 
-    init(path: String, handler: @escaping ([String]) -> Void) {
+    init(path: String, handler: @escaping ([Event]) -> Void) throws {
         self.handler = handler
         var context = FSEventStreamContext(version: 0,
                                           info: Unmanaged.passUnretained(self).toOpaque(),
@@ -310,18 +511,26 @@ final class DirectoryWatcher {
                                           copyDescription: nil)
         let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes
             | kFSEventStreamCreateFlagFileEvents
-            | kFSEventStreamCreateFlagNoDefer)
+            | kFSEventStreamCreateFlagNoDefer
+            | kFSEventStreamCreateFlagWatchRoot)
         guard let created = FSEventStreamCreate(kCFAllocatorDefault,
                                                watcherCallback,
                                                &context,
                                                [path] as CFArray,
                                                FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
                                                0.15,
-                                               flags) else { return }
+                                               flags) else { throw WatchError.creationFailed(path) }
         stream = created
         FSEventStreamSetDispatchQueue(created, DispatchQueue.main)
-        FSEventStreamStart(created)
+        guard FSEventStreamStart(created) else {
+            FSEventStreamInvalidate(created)
+            FSEventStreamRelease(created)
+            stream = nil
+            throw WatchError.startFailed(path)
+        }
     }
+
+    fileprivate func receive(_ events: [Event]) { handler(events) }
 
     deinit {
         guard let stream else { return }
@@ -335,58 +544,140 @@ final class DirectoryWatcher {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: DirectoryWatcher?
-    private var handled = Set<String>()
+    private var watchedDirectory: URL?
+    private var watcherRefreshTimer: Timer?
+    private var pending: [FileIdentity: UUID] = [:]
+    private var recentlyHandled: [FileIdentity: Date] = [:]
+
+    private struct FileIdentity: Hashable {
+        let device: UInt64
+        let inode: UInt64
+
+        init?(attributes: [FileAttributeKey: Any]) {
+            guard let device = attributes[.systemNumber] as? NSNumber,
+                  let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+            self.device = device.uint64Value
+            self.inode = inode.uint64Value
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let directory = screenshotDirectory()
-        watcher = DirectoryWatcher(path: directory.path) { [weak self] paths in
-            for path in paths { self?.consider(path: path) }
+        configureWatcher(force: true)
+        watcherRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.configureWatcher(force: false)
         }
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
-            queue: .main
-        ) { _ in PinManager.shared.layout() }
+            queue: nil
+        ) { _ in
+            DispatchQueue.main.async { PinManager.shared.layout() }
+        }
+    }
+
+    private func configureWatcher(force: Bool) {
+        let directory = screenshotDirectory().standardizedFileURL
+        guard force || directory != watchedDirectory || watcher == nil else { return }
+        watcher = nil
+        watchedDirectory = directory
+        do {
+            watcher = try DirectoryWatcher(path: directory.path) { [weak self] events in
+                self?.receive(events)
+            }
+            NSLog("ShotPin: watching %@", directory.path)
+        } catch {
+            NSLog("ShotPin: watcher unavailable for %@: %@; retrying", directory.path, error.localizedDescription)
+        }
+    }
+
+    private func receive(_ events: [DirectoryWatcher.Event]) {
+        if events.contains(where: \DirectoryWatcher.Event.requiresRescan) {
+            NSLog("ShotPin: FSEvents reported dropped or invalidated events; rescanning")
+            rescanWatchedDirectory()
+            configureWatcher(force: true)
+        }
+        for event in events where event.isFile && event.isCreatedOrMoved {
+            consider(path: event.path)
+        }
+    }
+
+    private func rescanWatchedDirectory() {
+        guard let directory = watchedDirectory,
+              let contents = try? shotFileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+              ) else { return }
+        for url in contents { consider(path: url.path) }
     }
 
     private func consider(path: String) {
-        let url = URL(fileURLWithPath: path)
+        guard let directory = watchedDirectory else { return }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        // FSEvents watches directory trees. Screenshots only land directly in the
+        // configured destination, so accepting descendants catches unrelated files.
+        guard url.deletingLastPathComponent() == directory else { return }
         let name = url.lastPathComponent
         guard !name.hasPrefix("."), watchedExtensions.contains(url.pathExtension.lowercased()) else { return }
-        guard !handled.contains(url.path) else { return }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+        guard let attributes = try? shotFileManager.attributesOfItem(atPath: path),
+              let identity = FileIdentity(attributes: attributes),
               let created = attributes[.creationDate] as? Date,
               Date().timeIntervalSince(created) < 15 else { return }
-        handled.insert(url.path)
-        pin(url: url, attempt: 0, lastSize: -1)
+        let now = Date()
+        recentlyHandled = recentlyHandled.filter { now.timeIntervalSince($0.value) < 60 }
+        guard pending[identity] == nil, recentlyHandled[identity] == nil else { return }
+        let token = UUID()
+        pending[identity] = token
+        pin(url: url, identity: identity, token: token, attempt: 0, lastSize: -1)
     }
 
     /// Spotlight metadata and the file bytes both land slightly after the create
     /// event, so retry briefly before giving up or pinning on the fallback path.
-    private func pin(url: URL, attempt: Int, lastSize: Int) {
-        let maxAttempts = 8
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let size = (attributes?[.size] as? Int) ?? 0
+    private func pin(url: URL, identity: FileIdentity, token: UUID, attempt: Int, lastSize: Int) {
+        guard pending[identity] == token else { return }
+        let maxAttempts = 20
+        let attributes = try? shotFileManager.attributesOfItem(atPath: url.path)
+        guard let attributes, FileIdentity(attributes: attributes) == identity else {
+            pending.removeValue(forKey: identity)
+            return
+        }
+        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
         let stable = size > 0 && size == lastSize
         let capture = isScreenCapture(url)
 
-        if capture == false { return }
+        if capture == false {
+            pending.removeValue(forKey: identity)
+            recentlyHandled[identity] = Date()
+            return
+        }
         let exhausted = attempt >= maxAttempts
-        // Metadata that never arrives falls back to "a fresh image file counts".
-        if (stable && capture == true) || (exhausted && (capture == true || stable)) {
+        // When Spotlight is unavailable, only macOS' generated filename is accepted.
+        // Arbitrarily named screencapture CLI output normally carries Spotlight's
+        // capture attribute and follows the authoritative branch above.
+        let generatedNameFallback = capture == nil && hasGeneratedScreenshotName(url)
+        if (stable && capture == true) || (exhausted && stable && generatedNameFallback) {
+            pending.removeValue(forKey: identity)
+            recentlyHandled[identity] = Date()
             show(url: url)
             return
         }
-        guard !exhausted else { return }
+        guard !exhausted else {
+            pending.removeValue(forKey: identity)
+            recentlyHandled[identity] = Date()
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.pin(url: url, attempt: attempt + 1, lastSize: size)
+            self?.pin(url: url, identity: identity, token: token, attempt: attempt + 1, lastSize: size)
         }
     }
 
     private func show(url: URL) {
-        guard FileManager.default.fileExists(atPath: url.path),
-              let image = NSImage(contentsOf: url), image.size.width > 0 else { return }
-        PinManager.shared.add(url: url, image: image)
+        guard shotFileManager.fileExists(atPath: url.path) else { return }
+        ThumbnailLoader.load(url) { image in
+            guard shotFileManager.fileExists(atPath: url.path),
+                  let image, image.size.width > 0, image.size.height > 0 else { return }
+            PinManager.shared.add(url: url, image: image)
+        }
     }
 }
 

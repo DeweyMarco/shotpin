@@ -61,11 +61,11 @@ float above other windows and follow you across Spaces and full-screen apps.
 ## What gets pinned
 
 The watched folder is whatever `com.apple.screencapture location` points at, falling back
-to `~/Desktop`. A new image file is only pinned when Spotlight marks it
+to `~/Desktop`. A new image file is pinned when Spotlight marks it
 `kMDItemIsScreenCapture`, so an image you save from a browser to the Desktop is ignored.
-When that metadata never shows up (region captures from the `screencapture` CLI, for
-instance), any image file created in the last 15 seconds is pinned as a fallback. Screen
-recordings are skipped.
+If Spotlight metadata is delayed or unavailable, ShotPin only falls back to fresh files
+whose names match macOS' generated screenshot naming convention. Arbitrarily named
+`screencapture` CLI output may therefore be skipped. Screen recordings are skipped.
 
 ## Install
 
@@ -80,7 +80,9 @@ cd shotpin
 
 That compiles `ShotPin.app` into `~/Applications`, turns off the native thumbnail
 (`com.apple.screencapture show-thumbnail`, since it would fight for the same corner and
-delay the file write), and loads a LaunchAgent so ShotPin runs at login.
+delay the file write), and loads a LaunchAgent so ShotPin runs at login. Choosing Quit
+stops ShotPin for the rest of the login session; it starts again at the next login or
+when you run the `kickstart` command below.
 
 Two prompts to expect on first run: macOS asks whether ShotPin may access your Desktop
 folder, and it posts a notice that ShotPin can run in the background. Both are one-time.

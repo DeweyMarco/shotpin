@@ -1,15 +1,30 @@
 #!/bin/bash
-# Compiles ShotPin and assembles it into ~/Applications/ShotPin.app
+# Compiles ShotPin and atomically installs it into ~/Applications/ShotPin.app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$HOME/Applications/ShotPin.app"
-BIN="$APP/Contents/MacOS/ShotPin"
+APP_DIR="$HOME/Applications"
+APP="$APP_DIR/ShotPin.app"
+ARCH="${SHOTPIN_ARCH:-$(uname -m)}"
+BUILD_DIR=""
 
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cleanup() {
+  if [[ -n "$BUILD_DIR" && -e "$BUILD_DIR/Previous.app" && ! -e "$APP" ]]; then
+    mv "$BUILD_DIR/Previous.app" "$APP"
+  fi
+  if [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]]; then
+    rm -rf "$BUILD_DIR"
+  fi
+}
+trap cleanup EXIT
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+mkdir -p "$APP_DIR"
+BUILD_DIR="$(mktemp -d "$APP_DIR/.ShotPin.build.XXXXXX")"
+STAGED_APP="$BUILD_DIR/ShotPin.app"
+BIN="$STAGED_APP/Contents/MacOS/ShotPin"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
+
+cat > "$STAGED_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -28,9 +43,25 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-swiftc -O -framework AppKit -framework CoreServices \
+plutil -lint "$STAGED_APP/Contents/Info.plist"
+swiftc -O -target "${ARCH}-apple-macosx13.0" \
+  -framework AppKit -framework CoreServices \
   -o "$BIN" "$ROOT/Sources/main.swift"
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+codesign --force --sign - "$STAGED_APP"
+codesign --verify --deep --strict "$STAGED_APP"
+
+# Both paths live in APP_DIR, so each rename is atomic. Keep the previous bundle
+# until the replacement is in place, and restore it if that final rename fails.
+BACKUP_APP="$BUILD_DIR/Previous.app"
+if [[ -e "$APP" ]]; then
+  mv "$APP" "$BACKUP_APP"
+fi
+if ! mv "$STAGED_APP" "$APP"; then
+  if [[ -e "$BACKUP_APP" ]]; then
+    mv "$BACKUP_APP" "$APP"
+  fi
+  exit 1
+fi
 
 echo "built $APP"
