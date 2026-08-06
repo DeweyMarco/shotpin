@@ -56,40 +56,13 @@ func hasGeneratedScreenshotName(_ url: URL, defaults: UserDefaults? = UserDefaul
 
 // MARK: - The pinned card
 
-final class HoverTintButton: NSButton {
-    private var hoverTrackingArea: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-
-        if let hoverTrackingArea {
-            removeTrackingArea(hoverTrackingArea)
-        }
-
-        let trackingArea = NSTrackingArea(rect: .zero,
-                                          options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                          owner: self,
-                                          userInfo: nil)
-        addTrackingArea(trackingArea)
-        hoverTrackingArea = trackingArea
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        contentTintColor = .systemRed
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        contentTintColor = .secondaryLabelColor
-    }
-}
-
 final class ShotView: NSView, NSDraggingSource {
     private static let copyQueue = DispatchQueue(label: "app.shotpin.copy-loader", qos: .userInitiated)
 
     let url: URL
     private let imageView = NSImageView()
     private let card = NSView()
-    private let closeButton = HoverTintButton()
+    private let closeButton = NSButton()
     private let errorLabel = NSTextField(labelWithString: "")
     private var hideErrorWorkItem: DispatchWorkItem?
     private var mouseDownPoint: NSPoint?
@@ -143,7 +116,7 @@ final class ShotView: NSView, NSDraggingSource {
         closeButton.image = glyph
         closeButton.isBordered = false
         closeButton.bezelStyle = .inline
-        closeButton.contentTintColor = NSColor.secondaryLabelColor
+        closeButton.contentTintColor = NSColor.systemRed
         closeButton.imageScaling = .scaleProportionallyDown
         closeButton.frame = NSRect(x: 2, y: total.height - 22, width: 20, height: 20)
         closeButton.target = self
