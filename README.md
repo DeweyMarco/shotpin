@@ -17,6 +17,9 @@ capture itself. It watches the screenshot folder and pins whatever appears.
         bottom-right, no timer
 ```
 
+ShotPin's thumbnails are excluded from screen capture, so pinned screenshots don't
+appear inside later screenshots.
+
 ## Why not just use the built-in preference
 
 macOS has an undocumented key that extends the native thumbnail's lifetime:
@@ -36,8 +39,9 @@ sitting in your corner is unsaved; kill `screencaptureui`, log out, or reboot an
 gone. I tested exactly that, and the pending capture was lost.
 
 ShotPin works the other way around. The file is written first, by the normal macOS path,
-and the pin is just a view onto a file that already exists safely on disk. Dismissing a
-pin never destroys anything except the pin.
+and the pin is just a view onto a file that already exists safely on disk. Clicking the
+pin's ✕ moves that screenshot to Trash; the context menu still offers Dismiss when you
+only want to remove the pin.
 
 Compared to the full CleanShot X alternatives ([Capso](https://github.com/lzhgus/Capso),
 [BetterShot](https://github.com/KartikLabhshetwar/better-shot),
@@ -50,13 +54,15 @@ one thing and leaves the native flow alone.
 - **Click** the pin: opens the file in its default app, then the pin clears.
 - **Drag** the pin: drags the real file into Slack, Notion, a browser, a Finder window.
   The pin clears once the drop lands.
-- **Hover** the pin: an ✕ appears in the top-left corner.
+- **Hover** the pin: an ✕ appears in the top-left corner; click it to move the screenshot
+  to Trash and remove the pin.
 - **Right-click**: Open, Copy Image, Reveal in Finder, Move to Trash, Dismiss,
   Dismiss All, Quit ShotPin.
 
 Nothing dismisses itself on a timer. Several screenshots in a row stack upward from the
 corner, oldest at the bottom, and pile up in place once the column runs out of room. Pins
-float above other windows and follow you across Spaces and full-screen apps.
+float above other windows and follow you across Spaces and full-screen apps, but don't
+appear in screenshots.
 
 ## What gets pinned
 

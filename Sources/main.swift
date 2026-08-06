@@ -112,7 +112,7 @@ final class ShotView: NSView, NSDraggingSource {
         errorLabel.isHidden = true
         card.addSubview(errorLabel)
 
-        let glyph = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Dismiss")
+        let glyph = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Delete Screenshot")
         closeButton.image = glyph
         closeButton.isBordered = false
         closeButton.bezelStyle = .inline
@@ -120,7 +120,7 @@ final class ShotView: NSView, NSDraggingSource {
         closeButton.imageScaling = .scaleProportionallyDown
         closeButton.frame = NSRect(x: 2, y: total.height - 22, width: 20, height: 20)
         closeButton.target = self
-        closeButton.action = #selector(dismissPin)
+        closeButton.action = #selector(trashFile)
         closeButton.isHidden = true
         addSubview(closeButton)
 
@@ -320,6 +320,7 @@ final class PinPanel: NSPanel {
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = true
         isMovableByWindowBackground = false
+        sharingType = .none
 
         let view = ShotView(url: url, image: image, cardSize: cardSize)
         view.panel = self
