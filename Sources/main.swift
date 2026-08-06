@@ -133,6 +133,18 @@ final class ShotView: NSView, NSDraggingSource {
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
 
+    /// The card and image view are visual-only. Keep the close button interactive,
+    /// but route the rest of the thumbnail's mouse sequence through ShotView so its
+    /// click and drag handling cannot be swallowed by an NSImageView/NSControl.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0, bounds.contains(point) else { return nil }
+        let closePoint = closeButton.convert(point, from: self)
+        if !closeButton.isHidden, closeButton.bounds.contains(closePoint) {
+            return closeButton
+        }
+        return self
+    }
+
     override func mouseEntered(with event: NSEvent) { closeButton.isHidden = false }
     override func mouseExited(with event: NSEvent) { closeButton.isHidden = true }
 
@@ -156,7 +168,7 @@ final class ShotView: NSView, NSDraggingSource {
 
         let item = NSDraggingItem(pasteboardWriter: url as NSURL)
         let dragImage = imageView.image ?? NSImage(size: card.bounds.size)
-        item.setDraggingFrame(convert(card.frame, to: nil), contents: dragImage)
+        item.setDraggingFrame(card.frame, contents: dragImage)
         beginDraggingSession(with: [item], event: event, source: self)
     }
 
